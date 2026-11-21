@@ -1,6 +1,6 @@
 # Mixer for MusicBee
 
-An intelligent vibe-matching Auto DJ plugin for MusicBee, created by buch.
+An intelligent vibe-matching Auto DJ plugin for MusicBee.
 
 Standard Auto DJ typically relies on broad metadata like genre tags or basic shuffle rules, which often leads to abrupt mood changes. Mixer analyzes the actual acoustic characteristics of your audio library to queue songs that genuinely fit together in tempo, harmony, and energy.
 
@@ -40,10 +40,8 @@ dotnet build -c Release
 
 The output DLL will be located at `bin/Release/net472/MB_Mixer.dll`.
 
-## Author
-
-Created by buch.
-
 ---
+
+Author: buch
 
 [buymeacoffee.com/buch](https://buymeacoffee.com/buch)
