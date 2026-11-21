@@ -27,8 +27,9 @@ Mixer profiles each track across several musical dimensions:
    ```bash
    python analyze_library.py
    ```
+   Note: Scanning can take some time depending on how many songs you have in your library.
 5. Restart MusicBee and enable Mixer under Edit > Preferences > Plugins.
-6. Open the Mixer tab from the top bar or dock it into your layout to start auto-mixing.
+6. Open the Mixer tab from the top bar, dock it into your layout, or access it from MusicBee > Tools > Mixer to start auto-mixing.
 
 ## Building from Source
 
