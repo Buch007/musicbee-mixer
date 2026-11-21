@@ -1,0 +1,20 @@
+# Build outputs
+bin/
+obj/
+
+# Python cache & databases
+__pycache__/
+*.py[cod]
+*.db
+*.csv
+
+# Local plugin settings & history
+mixer_settings.ini
+mixer_history.txt
+*.log
+
+# Visual Studio / IDE temporary files
+.vs/
+.idea/
+*.user
+*.suo
