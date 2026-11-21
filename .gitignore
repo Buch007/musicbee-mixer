@@ -1,6 +1,9 @@
 # Build outputs
 bin/
 obj/
+build/
+dist/
+*.spec
 
 # Python cache & databases
 __pycache__/

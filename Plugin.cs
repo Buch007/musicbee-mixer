@@ -1056,7 +1056,104 @@ namespace MusicBeePlugin
             }
         }
 
-        // ---- Background Scanning ----
+        // ---- Background Scanning & Auto-Provisioning ----
+
+        private string FindScannerExecutable()
+        {
+            // 1. Check Mixer persistent folder
+            string primary = Path.Combine(MixerFolder, "mixer_scanner.exe");
+            if (File.Exists(primary)) return primary;
+
+            // 2. Check MusicBee Plugins folder
+            try
+            {
+                string asmDir = Path.GetDirectoryName(typeof(Plugin).Assembly.Location);
+                if (!string.IsNullOrEmpty(asmDir))
+                {
+                    string candidate = Path.Combine(asmDir, "mixer_scanner.exe");
+                    if (File.Exists(candidate)) return candidate;
+
+                    candidate = Path.Combine(asmDir, "Mixer", "mixer_scanner.exe");
+                    if (File.Exists(candidate)) return candidate;
+                }
+            }
+            catch {}
+
+            // 3. Check development / workspace folder
+            string localDev = @"E:\projects\musicbee plugin\dist\mixer_scanner.exe";
+            if (File.Exists(localDev)) return localDev;
+
+            return null;
+        }
+
+        private void DownloadScannerAndScan(bool silent)
+        {
+            isScanning = true;
+            string targetPath = Path.Combine(MixerFolder, "mixer_scanner.exe");
+            string tempPath = targetPath + ".download";
+
+            if (lblStatus != null && !lblStatus.IsDisposed)
+            {
+                lblStatus.BeginInvoke(new Action(() => lblStatus.Text = "Status: Downloading audio scanner (0%)..."));
+            }
+            if (lblMixerStats != null && !lblMixerStats.IsDisposed)
+            {
+                lblMixerStats.BeginInvoke(new Action(() => lblMixerStats.Text = "Downloading audio analysis scanner from GitHub (0%)..."));
+            }
+
+            ThreadPool.QueueUserWorkItem(_ =>
+            {
+                try
+                {
+                    Directory.CreateDirectory(MixerFolder);
+                    System.Net.ServicePointManager.SecurityProtocol |= System.Net.SecurityProtocolType.Tls12;
+
+                    using (System.Net.WebClient wc = new System.Net.WebClient())
+                    {
+                        wc.Headers.Add("User-Agent", "Mixer-MusicBee-Plugin");
+                        wc.DownloadProgressChanged += (s, e) =>
+                        {
+                            int pct = e.ProgressPercentage;
+                            if (lblStatus != null && !lblStatus.IsDisposed)
+                            {
+                                lblStatus.BeginInvoke(new Action(() => lblStatus.Text = string.Format(CultureInfo.InvariantCulture, "Status: Downloading audio scanner ({0}%)...", pct)));
+                            }
+                            if (lblMixerStats != null && !lblMixerStats.IsDisposed)
+                            {
+                                lblMixerStats.BeginInvoke(new Action(() => lblMixerStats.Text = string.Format(CultureInfo.InvariantCulture, "Downloading standalone audio scanner from GitHub: {0}% ({1:F1} MB / {2:F1} MB)", pct, e.BytesReceived / 1048576.0, e.TotalBytesToReceive / 1048576.0)));
+                            }
+                        };
+
+                        string downloadUrl = "https://github.com/Buch007/musicbee-mixer/releases/download/v1.0.1/mixer_scanner.exe";
+                        wc.DownloadFile(new Uri(downloadUrl), tempPath);
+                    }
+
+                    if (File.Exists(targetPath))
+                    {
+                        try { File.Delete(targetPath); } catch {}
+                    }
+                    File.Move(tempPath, targetPath);
+
+                    WriteLog("Standalone scanner downloaded successfully to: " + targetPath);
+                    isScanning = false;
+
+                    StartBackgroundScan(silent);
+                }
+                catch (Exception ex)
+                {
+                    isScanning = false;
+                    WriteLog("Failed to download scanner: " + ex.Message);
+                    if (lblStatus != null && !lblStatus.IsDisposed)
+                    {
+                        lblStatus.BeginInvoke(new Action(() => lblStatus.Text = "Status: Scanner download failed."));
+                    }
+                    if (!silent)
+                    {
+                        MessageBox.Show("Failed to download the audio scanner:\n" + ex.Message + "\n\nYou can manually download mixer_scanner.exe from GitHub Releases and place it in your MusicBee\\Plugins folder.", "Mixer", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    }
+                }
+            });
+        }
 
         private static string GetPythonExecutable()
         {
@@ -1136,10 +1233,27 @@ namespace MusicBeePlugin
                 return;
             }
 
-            string pythonExe = GetPythonExecutable();
-            if (string.IsNullOrEmpty(pythonExe))
+            string scannerExe = FindScannerExecutable();
+            string pythonExe = (scannerExe == null) ? GetPythonExecutable() : null;
+
+            if (scannerExe == null && string.IsNullOrEmpty(pythonExe))
             {
-                string msg = "Python (3.9+) was not found in PATH. Please install Python to scan your music library.";
+                if (!silent)
+                {
+                    DialogResult dr = MessageBox.Show(
+                        "Mixer requires the audio analysis scanner to profile your library.\n\nPython was not detected on your computer. Would you like Mixer to automatically download the standalone scanner component now (~114 MB)?",
+                        "Mixer Setup",
+                        MessageBoxButtons.YesNo,
+                        MessageBoxIcon.Question
+                    );
+                    if (dr == DialogResult.Yes)
+                    {
+                        DownloadScannerAndScan(silent);
+                        return;
+                    }
+                }
+
+                string msg = "Python (3.9+) or mixer_scanner.exe was not found. Please install Python or download mixer_scanner.exe from GitHub Releases.";
                 WriteLog(msg);
                 if (!silent)
                 {
@@ -1176,8 +1290,6 @@ namespace MusicBeePlugin
             {
                 try
                 {
-                    string scriptPath = FindAnalyzeScript();
-
                     string fileListArg = "";
                     if (files != null && files.Length > 0)
                     {
@@ -1206,14 +1318,28 @@ namespace MusicBeePlugin
                     }
 
                     string dbPath = Path.Combine(MixerFolder, "mixer_cache.db");
-                    string args = string.Format(CultureInfo.InvariantCulture, "\"{0}\" {1} --db \"{2}\" --quick --csv \"{3}\" --progress-file \"{4}\"",
-                        scriptPath, fileListArg, dbPath, CachePath, ProgressPath);
+                    string exeToRun;
+                    string args;
 
-                    WriteLog("Background scan starting with executable: " + pythonExe + " and args: " + args);
+                    if (!string.IsNullOrEmpty(scannerExe))
+                    {
+                        exeToRun = scannerExe;
+                        args = string.Format(CultureInfo.InvariantCulture, "{0} --db \"{1}\" --quick --csv \"{2}\" --progress-file \"{3}\"",
+                            fileListArg, dbPath, CachePath, ProgressPath);
+                    }
+                    else
+                    {
+                        string scriptPath = FindAnalyzeScript();
+                        exeToRun = pythonExe;
+                        args = string.Format(CultureInfo.InvariantCulture, "\"{0}\" {1} --db \"{2}\" --quick --csv \"{3}\" --progress-file \"{4}\"",
+                            scriptPath, fileListArg, dbPath, CachePath, ProgressPath);
+                    }
+
+                    WriteLog("Background scan starting with executable: " + exeToRun + " and args: " + args);
 
                     ProcessStartInfo psi = new ProcessStartInfo
                     {
-                        FileName = pythonExe,
+                        FileName = exeToRun,
                         Arguments = args,
                         CreateNoWindow = true,
                         UseShellExecute = false,
