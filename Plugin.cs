@@ -1,22 +1,24 @@
 // Mixer - MusicBee plugin (Spotify AI DJ Vibe Edition)
 //
-// Complete logic overhaul fixing all review findings:
-// 1. Duplicate track suppression & title/artist fingerprinting.
+// Complete logic overhaul:
+// 1. Duplicate track suppression & title/artist fingerprinting with bounded eviction.
 // 2. Pocket arc desynchronization fix on manual track changes.
 // 3. Thread-safe snapshot cache swapping.
 // 4. Settings persistence across MusicBee restarts.
-// 5. Rebalanced distance metric (Key, BPM, Energy, Groove, Valence, Acousticness).
+// 5. Rebalanced distance metric with functional Bridge transitions.
 // 6. Relative BPM tolerance (% based).
-// 7. O(1) history lookups via hash sets.
+// 7. O(1) thread-safe history lookups via hash sets and fingerprint counters.
 // 8. Elimination of API call storm by pre-filtering candidates.
 // 9. Queue stacking prevention.
 // 10. Fallback queueing for uncached tracks.
-// 11. Cross-session history persistence.
+// 11. Cross-session history persistence with deferred tag resolution.
 // 12. Mid-energy start ramp for "Play Random Song".
 // 13. Dynamic script path discovery.
 // 14. Real-time background scan progress polling in the UI.
-// 15. Minimum distance threshold to suppress identical audio files.
-// 16. Vibe Lock mode toggle & library coverage indicators.
+// 15. Single-check file verification eliminating I/O storms on NAS/network drives.
+// 16. Python environment detection & privacy-safe library fallback paths.
+// 17. Multiplier-based user affinity weighting preserving audio match priority.
+// 18. Self-capping debug log rotation at 2MB.
 
 using System;
 using System.Collections.Generic;
@@ -66,15 +68,23 @@ namespace MusicBeePlugin
             public double AcousticNorm;    // 0.0 to 1.0 (0=synthesized/distorted, 1=acoustic/organic)
         }
 
+        private class HistoryEntry
+        {
+            public string Url;
+            public string FilenameKey;
+            public string TitleArtistKey;
+        }
+
         private readonly object libraryLock = new object();
         private Dictionary<string, TrackFeatures> library =
             new Dictionary<string, TrackFeatures>(StringComparer.OrdinalIgnoreCase);
 
-        private readonly LinkedList<string> recentHistory = new LinkedList<string>();
+        private readonly object historyLock = new object();
+        private readonly LinkedList<HistoryEntry> recentHistory = new LinkedList<HistoryEntry>();
         private readonly HashSet<string> recentHistorySet = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        private readonly HashSet<string> recentTitleArtistSet = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        private readonly Random rng = new Random();
+        private readonly Dictionary<string, int> recentFingerprintCounts = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
 
+        private readonly Random rng = new Random();
         private int totalLibraryFileCount = 0;
 
         private int HistoryLimit
@@ -140,7 +150,7 @@ namespace MusicBeePlugin
             about.TargetApplication = "Mixer";
             about.Type = PluginType.General;
             about.VersionMajor = 2;
-            about.VersionMinor = 1;
+            about.VersionMinor = 2;
             about.Revision = 0;
             about.MinInterfaceVersion = MinInterfaceVersion;
             about.MinApiRevision = MinApiRevision;
@@ -153,7 +163,7 @@ namespace MusicBeePlugin
 
             int cachedCount;
             lock (libraryLock) { cachedCount = library.Count; }
-            WriteLog("Initialised Vibe DJ Edition v2.1. TracksLoaded=" + cachedCount);
+            WriteLog("Initialised Vibe DJ Edition v2.2. TracksLoaded=" + cachedCount);
 
             try
             {
@@ -247,6 +257,31 @@ namespace MusicBeePlugin
         {
             if (type == NotificationType.PluginStartup)
             {
+                // Defer background fingerprinting of loaded history to avoid startup API blocking
+                ThreadPool.QueueUserWorkItem(_ =>
+                {
+                    try
+                    {
+                        lock (historyLock)
+                        {
+                            foreach (var item in recentHistory)
+                            {
+                                if (item.TitleArtistKey == null && !string.IsNullOrEmpty(item.Url))
+                                {
+                                    string title = mbApiInterface.Library_GetFileTag(item.Url, MetaDataType.TrackTitle);
+                                    string artist = mbApiInterface.Library_GetFileTag(item.Url, MetaDataType.Artist);
+                                    if (!string.IsNullOrEmpty(title))
+                                    {
+                                        item.TitleArtistKey = (artist ?? "").Trim().ToLowerInvariant() + "|" + title.Trim().ToLowerInvariant();
+                                        IncrementFingerprint(item.TitleArtistKey);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    catch {}
+                });
+
                 try
                 {
                     string[] files;
@@ -344,12 +379,27 @@ namespace MusicBeePlugin
                 if (File.Exists(HistoryPath))
                 {
                     string[] lines = File.ReadAllLines(HistoryPath);
-                    for (int i = lines.Length - 1; i >= 0; i--)
+                    lock (historyLock)
                     {
-                        string url = lines[i].Trim();
-                        if (!string.IsNullOrEmpty(url))
+                        recentHistory.Clear();
+                        recentHistorySet.Clear();
+                        recentFingerprintCounts.Clear();
+
+                        for (int i = lines.Length - 1; i >= 0; i--)
                         {
-                            RememberPlayed(url);
+                            string url = lines[i].Trim();
+                            if (!string.IsNullOrEmpty(url))
+                            {
+                                string fnKey = Path.GetFileNameWithoutExtension(url).Trim().ToLowerInvariant();
+                                recentHistorySet.Add(url);
+                                IncrementFingerprint(fnKey);
+                                recentHistory.AddFirst(new HistoryEntry
+                                {
+                                    Url = url,
+                                    FilenameKey = fnKey,
+                                    TitleArtistKey = null
+                                });
+                            }
                         }
                     }
                 }
@@ -365,12 +415,50 @@ namespace MusicBeePlugin
             try
             {
                 Directory.CreateDirectory(MixerFolder);
-                List<string> list = new List<string>(recentHistory);
+                List<string> list = new List<string>();
+                lock (historyLock)
+                {
+                    foreach (var entry in recentHistory)
+                    {
+                        list.Add(entry.Url);
+                    }
+                }
                 File.WriteAllLines(HistoryPath, list.ToArray());
             }
             catch (Exception ex)
             {
                 WriteLog("SaveHistory error: " + ex.Message);
+            }
+        }
+
+        private void IncrementFingerprint(string key)
+        {
+            if (string.IsNullOrEmpty(key)) return;
+            int count;
+            if (recentFingerprintCounts.TryGetValue(key, out count))
+            {
+                recentFingerprintCounts[key] = count + 1;
+            }
+            else
+            {
+                recentFingerprintCounts[key] = 1;
+            }
+        }
+
+        private void DecrementFingerprint(string key)
+        {
+            if (string.IsNullOrEmpty(key)) return;
+            int count;
+            if (recentFingerprintCounts.TryGetValue(key, out count))
+            {
+                if (count <= 1)
+                {
+                    recentFingerprintCounts.Remove(key);
+                }
+                else
+                {
+                    recentFingerprintCounts[key] = count - 1;
+                }
             }
         }
 
@@ -423,7 +511,7 @@ namespace MusicBeePlugin
                 // Header
                 Label lblHeader = new Label
                 {
-                    Text = "🎧 Mixer AI DJ",
+                    Text = "Mixer AI DJ",
                     Font = new Font("Segoe UI", 16F, FontStyle.Bold),
                     ForeColor = panelFg,
                     AutoSize = true,
@@ -453,9 +541,9 @@ namespace MusicBeePlugin
 
                 btnPlayRandom = new Button
                 {
-                    Text = "▶  Play Random Song",
+                    Text = "Play Random Song",
                     Font = new Font("Segoe UI", 9.5F, FontStyle.Bold),
-                    Size = new Size(190, 38),
+                    Size = new Size(180, 38),
                     BackColor = accentBtnBg,
                     ForeColor = Color.White,
                     FlatStyle = FlatStyle.Flat,
@@ -468,9 +556,9 @@ namespace MusicBeePlugin
 
                 btnQueueNext = new Button
                 {
-                    Text = "➕  Queue Next Match",
+                    Text = "Queue Next Match",
                     Font = new Font("Segoe UI", 9F, FontStyle.Regular),
-                    Size = new Size(160, 38),
+                    Size = new Size(150, 38),
                     BackColor = secondaryBtnBg,
                     ForeColor = panelFg,
                     FlatStyle = FlatStyle.Flat,
@@ -483,9 +571,9 @@ namespace MusicBeePlugin
 
                 btnRescanTab = new Button
                 {
-                    Text = "🔄  Rescan Library",
+                    Text = "Rescan Library",
                     Font = new Font("Segoe UI", 9F, FontStyle.Regular),
-                    Size = new Size(140, 38),
+                    Size = new Size(130, 38),
                     BackColor = secondaryBtnBg,
                     ForeColor = panelFg,
                     FlatStyle = FlatStyle.Flat,
@@ -510,7 +598,7 @@ namespace MusicBeePlugin
 
                 chkAutoMix = new CheckBox
                 {
-                    Text = "⚡ Auto-mix: Instantly queue harmonic match whenever any song plays",
+                    Text = "Auto-mix: Instantly queue harmonic match whenever any song plays",
                     Checked = autoMixEnabled,
                     Font = new Font("Segoe UI", 9.25F, FontStyle.Regular),
                     ForeColor = panelFg,
@@ -528,7 +616,7 @@ namespace MusicBeePlugin
 
                 chkVibeLock = new CheckBox
                 {
-                    Text = "🔒 Vibe Lock: Lock current mood & energy (no bridge transitions)",
+                    Text = "Vibe Lock: Lock current mood & energy (no bridge transitions)",
                     Checked = vibeLockEnabled,
                     Font = new Font("Segoe UI", 9.25F, FontStyle.Regular),
                     ForeColor = panelFg,
@@ -552,7 +640,7 @@ namespace MusicBeePlugin
                     new Size(660, 95),
                     cardBg,
                     cardBorder,
-                    "🎵  CURRENTLY PLAYING",
+                    "CURRENTLY PLAYING",
                     panelFg,
                     subText,
                     out lblNowPlayingTitle,
@@ -566,7 +654,7 @@ namespace MusicBeePlugin
                     new Size(660, 95),
                     cardBg,
                     cardBorder,
-                    "⏭️  QUEUED NEXT BY MIXER (VIBE HARMONIC MATCH)",
+                    "QUEUED NEXT BY MIXER (VIBE HARMONIC MATCH)",
                     panelFg,
                     subText,
                     out lblUpNextTitle,
@@ -632,7 +720,7 @@ namespace MusicBeePlugin
                             }
                             if (lblMixerStats != null && !lblMixerStats.IsDisposed)
                             {
-                                lblMixerStats.Text = "🔄 Scanning library: " + line;
+                                lblMixerStats.Text = "Scanning library: " + line;
                             }
                         }
                     }
@@ -694,6 +782,9 @@ namespace MusicBeePlugin
             int cachedCount;
             lock (libraryLock) { cachedCount = library.Count; }
 
+            int histCount;
+            lock (historyLock) { histCount = recentHistory.Count; }
+
             string coverageText = (totalLibraryFileCount > 0)
                 ? string.Format(CultureInfo.InvariantCulture, "{0} / {1} ({2:F1}%)", cachedCount, totalLibraryFileCount, (cachedCount * 100.0) / totalLibraryFileCount)
                 : cachedCount.ToString(CultureInfo.InvariantCulture);
@@ -703,8 +794,8 @@ namespace MusicBeePlugin
                 : ((sessionPocketTrackCount >= 3) ? "Bridge Transition" : string.Format(CultureInfo.InvariantCulture, "Groove Pocket ({0} of 3)", (sessionPocketTrackCount % 3) + 1));
 
             return string.Format(CultureInfo.InvariantCulture,
-                "📊 Library: {0} indexed   |   History: {1} tracks avoided   |   DJ Flow: {2}   |   Auto-Mix: {3}",
-                coverageText, recentHistory.Count, arcDesc, autoMixEnabled ? "Active" : "Paused");
+                "Library: {0} indexed   |   History: {1} tracks avoided   |   DJ Flow: {2}   |   Auto-Mix: {3}",
+                coverageText, histCount, arcDesc, autoMixEnabled ? "Active" : "Paused");
         }
 
         private void UpdateStatsLabel()
@@ -850,7 +941,6 @@ namespace MusicBeePlugin
             List<string> candidateKeys = new List<string>();
             foreach (var kvp in libSnapshot)
             {
-                if (!File.Exists(kvp.Key)) continue;
                 if (kvp.Value.EnergyNorm >= 0.35 && kvp.Value.EnergyNorm <= 0.70)
                 {
                     candidateKeys.Add(kvp.Key);
@@ -859,16 +949,32 @@ namespace MusicBeePlugin
 
             if (candidateKeys.Count == 0)
             {
-                foreach (var kvp in libSnapshot)
+                candidateKeys.AddRange(libSnapshot.Keys);
+            }
+
+            // Pick a track that exists on disk
+            string randomTrack = null;
+            while (candidateKeys.Count > 0)
+            {
+                int idx = rng.Next(candidateKeys.Count);
+                string candidate = candidateKeys[idx];
+                if (File.Exists(candidate))
                 {
-                    if (File.Exists(kvp.Key))
-                    {
-                        candidateKeys.Add(kvp.Key);
-                    }
+                    randomTrack = candidate;
+                    break;
+                }
+                else
+                {
+                    candidateKeys.RemoveAt(idx);
+                    lock (libraryLock) { library.Remove(candidate); }
                 }
             }
 
-            string randomTrack = candidateKeys[rng.Next(candidateKeys.Count)];
+            if (randomTrack == null)
+            {
+                MessageBox.Show("None of the cached tracks were found on disk. Please rescan your library.", "Mixer", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
 
             try
             {
@@ -952,6 +1058,35 @@ namespace MusicBeePlugin
 
         // ---- Background Scanning ----
 
+        private static string GetPythonExecutable()
+        {
+            string[] candidates = new string[] { "py", "python", "python3" };
+            foreach (var cmd in candidates)
+            {
+                try
+                {
+                    ProcessStartInfo testPsi = new ProcessStartInfo
+                    {
+                        FileName = cmd,
+                        Arguments = "--version",
+                        CreateNoWindow = true,
+                        UseShellExecute = false,
+                        WindowStyle = ProcessWindowStyle.Hidden
+                    };
+                    using (Process p = Process.Start(testPsi))
+                    {
+                        if (p != null)
+                        {
+                            p.WaitForExit(2000);
+                            if (p.ExitCode == 0) return cmd;
+                        }
+                    }
+                }
+                catch {}
+            }
+            return null;
+        }
+
         private string FindAnalyzeScript()
         {
             string primary = Path.Combine(MixerFolder, "analyze_library.py");
@@ -1001,6 +1136,18 @@ namespace MusicBeePlugin
                 return;
             }
 
+            string pythonExe = GetPythonExecutable();
+            if (string.IsNullOrEmpty(pythonExe))
+            {
+                string msg = "Python (3.9+) was not found in PATH. Please install Python to scan your music library.";
+                WriteLog(msg);
+                if (!silent)
+                {
+                    MessageBox.Show(msg, "Mixer", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                }
+                return;
+            }
+
             isScanning = true;
             if (lblStatus != null && !lblStatus.IsDisposed)
             {
@@ -1010,7 +1157,7 @@ namespace MusicBeePlugin
             {
                 lblMixerStats.BeginInvoke(new Action(() =>
                 {
-                    lblMixerStats.Text = "📊 Scanning library with Vibe Audio analysis in background...";
+                    lblMixerStats.Text = "Scanning library with Vibe Audio analysis in background...";
                 }));
             }
 
@@ -1040,18 +1187,33 @@ namespace MusicBeePlugin
                     }
                     else
                     {
-                        fileListArg = "\"D:\\ANJU\\music\" \"C:\\Users\\buch808\\Music\"";
+                        string myMusic = Environment.GetFolderPath(Environment.SpecialFolder.MyMusic);
+                        if (!string.IsNullOrEmpty(myMusic) && Directory.Exists(myMusic))
+                        {
+                            fileListArg = string.Format(CultureInfo.InvariantCulture, "\"{0}\"", myMusic);
+                        }
+                    }
+
+                    if (string.IsNullOrEmpty(fileListArg))
+                    {
+                        WriteLog("No audio files found to scan.");
+                        if (!silent)
+                        {
+                            MessageBox.Show("No music files found in your MusicBee library to scan.", "Mixer", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                        }
+                        isScanning = false;
+                        return;
                     }
 
                     string dbPath = Path.Combine(MixerFolder, "mixer_cache.db");
                     string args = string.Format(CultureInfo.InvariantCulture, "\"{0}\" {1} --db \"{2}\" --quick --csv \"{3}\" --progress-file \"{4}\"",
                         scriptPath, fileListArg, dbPath, CachePath, ProgressPath);
 
-                    WriteLog("Background scan starting with arguments: " + args);
+                    WriteLog("Background scan starting with executable: " + pythonExe + " and args: " + args);
 
                     ProcessStartInfo psi = new ProcessStartInfo
                     {
-                        FileName = "py",
+                        FileName = pythonExe,
                         Arguments = args,
                         CreateNoWindow = true,
                         UseShellExecute = false,
@@ -1102,7 +1264,7 @@ namespace MusicBeePlugin
             });
         }
 
-        // ---- Cache Loading (Thread-Safe Snapshot Swap) ----
+        // ---- Cache Loading (Thread-Safe Snapshot Swap with Single-Pass File Check) ----
 
         private void LoadCache()
         {
@@ -1123,6 +1285,10 @@ namespace MusicBeePlugin
                     string[] fields = ParseCsvLine(lines[i]);
                     if (fields.Length < 5) continue;
 
+                    string trackPath = NormalizeUrl(fields[0]);
+                    // Verify file exists on disk once at cache load time, avoiding per-track I/O storms later
+                    if (!File.Exists(trackPath)) continue;
+
                     double bpm, energy;
                     if (!double.TryParse(fields[1], NumberStyles.Float, CultureInfo.InvariantCulture, out bpm)) continue;
                     if (!double.TryParse(fields[4], NumberStyles.Float, CultureInfo.InvariantCulture, out energy)) continue;
@@ -1135,7 +1301,7 @@ namespace MusicBeePlugin
                         double.TryParse(fields[7], NumberStyles.Float, CultureInfo.InvariantCulture, out acoustic);
                     }
 
-                    newLibrary[NormalizeUrl(fields[0])] = new TrackFeatures
+                    newLibrary[trackPath] = new TrackFeatures
                     {
                         Bpm = bpm,
                         CamelotKey = fields[3],
@@ -1226,53 +1392,82 @@ namespace MusicBeePlugin
         {
             if (string.IsNullOrEmpty(url)) return;
 
-            recentHistory.Remove(url);
-            recentHistory.AddFirst(url);
-            recentHistorySet.Add(url);
+            string filenameKey = Path.GetFileNameWithoutExtension(url).Trim().ToLowerInvariant();
+            string titleArtistKey = null;
 
-            // Fingerprint by title + artist to prevent duplicate files at different paths
             try
             {
                 string title = mbApiInterface.Library_GetFileTag(url, MetaDataType.TrackTitle);
                 string artist = mbApiInterface.Library_GetFileTag(url, MetaDataType.Artist);
                 if (!string.IsNullOrEmpty(title))
                 {
-                    string key = (artist ?? "").Trim().ToLowerInvariant() + "|" + title.Trim().ToLowerInvariant();
-                    recentTitleArtistSet.Add(key);
+                    titleArtistKey = (artist ?? "").Trim().ToLowerInvariant() + "|" + title.Trim().ToLowerInvariant();
                 }
-                string filenameKey = Path.GetFileNameWithoutExtension(url).Trim().ToLowerInvariant();
-                recentTitleArtistSet.Add(filenameKey);
             }
             catch {}
 
-            while (recentHistory.Count > HistoryLimit)
+            lock (historyLock)
             {
-                string removed = recentHistory.Last.Value;
-                recentHistory.RemoveLast();
-                recentHistorySet.Remove(removed);
+                LinkedListNode<HistoryEntry> node = recentHistory.First;
+                while (node != null)
+                {
+                    if (string.Equals(node.Value.Url, url, StringComparison.OrdinalIgnoreCase))
+                    {
+                        DecrementFingerprint(node.Value.FilenameKey);
+                        DecrementFingerprint(node.Value.TitleArtistKey);
+                        recentHistory.Remove(node);
+                        break;
+                    }
+                    node = node.Next;
+                }
+
+                recentHistorySet.Add(url);
+                IncrementFingerprint(filenameKey);
+                IncrementFingerprint(titleArtistKey);
+
+                recentHistory.AddFirst(new HistoryEntry
+                {
+                    Url = url,
+                    FilenameKey = filenameKey,
+                    TitleArtistKey = titleArtistKey
+                });
+
+                while (recentHistory.Count > HistoryLimit)
+                {
+                    HistoryEntry removed = recentHistory.Last.Value;
+                    recentHistory.RemoveLast();
+                    recentHistorySet.Remove(removed.Url);
+                    DecrementFingerprint(removed.FilenameKey);
+                    DecrementFingerprint(removed.TitleArtistKey);
+                }
             }
         }
 
         private bool IsTrackRecentlyPlayed(string candidateUrl)
         {
-            if (recentHistorySet.Contains(candidateUrl)) return true;
+            if (string.IsNullOrEmpty(candidateUrl)) return true;
 
-            try
+            lock (historyLock)
             {
+                if (recentHistorySet.Contains(candidateUrl)) return true;
+
                 string filenameKey = Path.GetFileNameWithoutExtension(candidateUrl).Trim().ToLowerInvariant();
-                if (recentTitleArtistSet.Contains(filenameKey)) return true;
+                if (recentFingerprintCounts.ContainsKey(filenameKey)) return true;
 
-                string title = mbApiInterface.Library_GetFileTag(candidateUrl, MetaDataType.TrackTitle);
-                string artist = mbApiInterface.Library_GetFileTag(candidateUrl, MetaDataType.Artist);
-                if (!string.IsNullOrEmpty(title))
+                try
                 {
-                    string key = (artist ?? "").Trim().ToLowerInvariant() + "|" + title.Trim().ToLowerInvariant();
-                    if (recentTitleArtistSet.Contains(key)) return true;
+                    string title = mbApiInterface.Library_GetFileTag(candidateUrl, MetaDataType.TrackTitle);
+                    string artist = mbApiInterface.Library_GetFileTag(candidateUrl, MetaDataType.Artist);
+                    if (!string.IsNullOrEmpty(title))
+                    {
+                        string key = (artist ?? "").Trim().ToLowerInvariant() + "|" + title.Trim().ToLowerInvariant();
+                        if (recentFingerprintCounts.ContainsKey(key)) return true;
+                    }
                 }
-            }
-            catch {}
+                catch {}
 
-            return false;
+                return false;
+            }
         }
 
         private void QueueNextIfNeeded(string currentUrlOverride = null, bool force = false)
@@ -1309,7 +1504,7 @@ namespace MusicBeePlugin
                     string nextUrl = NormalizeUrl(mbApiInterface.NowPlayingList_GetListFileUrl(curIdx + 1));
                     if (!string.IsNullOrEmpty(nextUrl) && string.Equals(nextUrl, lastQueuedTrackUrl, StringComparison.OrdinalIgnoreCase))
                     {
-                        return; // Already queued next!
+                        return; // Already queued next
                     }
                 }
             }
@@ -1367,6 +1562,14 @@ namespace MusicBeePlugin
                 };
             }
 
+            HashSet<string> histSetSnapshot;
+            Dictionary<string, int> fpSnapshot;
+            lock (historyLock)
+            {
+                histSetSnapshot = new HashSet<string>(recentHistorySet, StringComparer.OrdinalIgnoreCase);
+                fpSnapshot = new Dictionary<string, int>(recentFingerprintCounts, StringComparer.OrdinalIgnoreCase);
+            }
+
             var candidates = new List<Candidate>();
             bool isBridge = !vibeLockEnabled && (sessionPocketTrackCount >= 3);
 
@@ -1379,18 +1582,15 @@ namespace MusicBeePlugin
             foreach (var pair in libSnapshot)
             {
                 if (string.Equals(pair.Key, currentUrl, StringComparison.OrdinalIgnoreCase)) continue;
-                if (recentHistorySet.Contains(pair.Key)) continue;
+                if (histSetSnapshot.Contains(pair.Key)) continue;
 
-                // Skip files that no longer exist on disk (moved or deleted)
-                if (!File.Exists(pair.Key)) continue;
-
-                // Eliminate identical audio files with duplicate paths
+                // Eliminate identical audio files with duplicate paths or names
                 string candidateCleanName = Path.GetFileNameWithoutExtension(pair.Key).Trim().ToLowerInvariant();
                 if (string.Equals(candidateCleanName, currentCleanName, StringComparison.OrdinalIgnoreCase)) continue;
-                if (recentTitleArtistSet.Contains(candidateCleanName)) continue;
+                if (fpSnapshot.ContainsKey(candidateCleanName)) continue;
 
                 double gap = BpmGap(seed.Bpm, pair.Value.Bpm);
-                double rawDistance = Distance(seed, pair.Value);
+                double rawDistance = Distance(seed, pair.Value, isBridge);
 
                 // Distance threshold: skip near-identical / duplicate tracks
                 if (rawDistance < 0.05) continue;
@@ -1432,8 +1632,8 @@ namespace MusicBeePlugin
                     int rating;
                     if (int.TryParse(ratingStr, out rating) && rating > 0)
                     {
-                        if (rating >= 80) affinityBonus += 0.40;
-                        else if (rating >= 60) affinityBonus += 0.20;
+                        if (rating >= 80) affinityBonus += 0.30;
+                        else if (rating >= 60) affinityBonus += 0.15;
                     }
                 }
                 catch {}
@@ -1444,7 +1644,7 @@ namespace MusicBeePlugin
                     int playCount;
                     if (int.TryParse(playCountStr, out playCount) && playCount > 4)
                     {
-                        affinityBonus += Math.Min(0.30, playCount * 0.02);
+                        affinityBonus += Math.Min(0.20, playCount * 0.015);
                     }
                 }
                 catch {}
@@ -1455,35 +1655,54 @@ namespace MusicBeePlugin
                     int skipCount;
                     if (int.TryParse(skipCountStr, out skipCount) && skipCount > 2)
                     {
-                        affinityBonus -= Math.Min(0.80, skipCount * 0.18);
+                        affinityBonus -= Math.Min(0.60, skipCount * 0.15);
                     }
                 }
                 catch {}
 
-                c.AdjustedDistance = Math.Max(0.05, c.RawDistance - affinityBonus);
+                // Multiplier adjustment: subtle nudge (up to 25% discount or penalty), preserving audio match precedence
+                double affinityMultiplier = 1.0 - Math.Min(0.25, Math.Max(-0.40, affinityBonus));
+                c.AdjustedDistance = Math.Max(0.05, c.RawDistance * affinityMultiplier);
                 topPool[i] = c;
             }
 
             // Step 3: Sort top candidates by adjusted distance
             topPool.Sort((x, y) => x.AdjustedDistance.CompareTo(y.AdjustedDistance));
 
-            // Pick at random from the 3 closest candidates
+            // Pick at random from the 3 closest candidates, verifying file exists on disk
             int topCount = Math.Min(3, topPool.Count);
             int selectedIndex = rng.Next(topCount);
 
-            int pocketIndex = (sessionPocketTrackCount % 3) + 1;
-            if (!vibeLockEnabled)
+            for (int attempt = 0; attempt < topPool.Count; attempt++)
             {
-                sessionPocketTrackCount = (sessionPocketTrackCount + 1) % 4;
+                int candidateIdx = (selectedIndex + attempt) % topPool.Count;
+                string targetUrl = topPool[candidateIdx].Url;
+                if (File.Exists(targetUrl))
+                {
+                    int pocketIndex = (sessionPocketTrackCount % 3) + 1;
+                    if (!vibeLockEnabled)
+                    {
+                        sessionPocketTrackCount = (sessionPocketTrackCount + 1) % 4;
+                    }
+
+                    return new PickResult
+                    {
+                        Url = targetUrl,
+                        Distance = topPool[candidateIdx].AdjustedDistance,
+                        IsBridge = isBridge,
+                        PocketIndex = pocketIndex
+                    };
+                }
+                else
+                {
+                    lock (libraryLock)
+                    {
+                        library.Remove(targetUrl);
+                    }
+                }
             }
 
-            return new PickResult
-            {
-                Url = topPool[selectedIndex].Url,
-                Distance = topPool[selectedIndex].AdjustedDistance,
-                IsBridge = isBridge,
-                PocketIndex = pocketIndex
-            };
+            return default(PickResult);
         }
 
         private static double BpmGap(double a, double b)
@@ -1494,28 +1713,38 @@ namespace MusicBeePlugin
             return Math.Min(direct, Math.Min(half, dbl));
         }
 
-        // Rebalanced multi-dimensional Vibe distance
-        private static double Distance(TrackFeatures a, TrackFeatures b)
+        // Rebalanced multi-dimensional Vibe distance with dynamic DJ Arc handling
+        private static double Distance(TrackFeatures a, TrackFeatures b, bool isBridge)
         {
-            // 1. Tempo distance
+            // 1. Tempo distance (always strict to preserve dance rhythm)
             double bpmDist = BpmGap(a.Bpm, b.Bpm) / 10.0;
 
-            // 2. Harmonic wheel distance scaled so it doesn't overpower mood and timbre
-            double keyDist = CamelotDistance(a.CamelotKey, b.CamelotKey) * 0.40;
-
-            // 3. Acoustic energy & loudness
-            double energyDist = Math.Abs(a.EnergyNorm - b.EnergyNorm) * 2.50;
-
-            // 4. Rhythm & groove match
-            double danceDist = Math.Abs(a.DanceNorm - b.DanceNorm) * 2.00;
-
-            // 5. Emotional valence / mood match
-            double valenceDist = Math.Abs(a.ValenceNorm - b.ValenceNorm) * 2.00;
-
-            // 6. Timbre & acousticness / production style match
-            double acousticDist = Math.Abs(a.AcousticNorm - b.AcousticNorm) * 2.00;
-
-            return bpmDist + keyDist + energyDist + danceDist + valenceDist + acousticDist;
+            if (isBridge)
+            {
+                // Bridge Transition:
+                // - Key distance penalty relaxed (weight 0.20 instead of 0.40) to encourage harmonic movement
+                // - Energy distance weight reduced from 2.50 to 1.20 to allow mood/intensity progression
+                // - Valence & Acousticness relaxed to permit vibe shifts
+                double keyDist = CamelotDistance(a.CamelotKey, b.CamelotKey) * 0.20;
+                double energyDist = Math.Abs(a.EnergyNorm - b.EnergyNorm) * 1.20;
+                double danceDist = Math.Abs(a.DanceNorm - b.DanceNorm) * 1.50;
+                double valenceDist = Math.Abs(a.ValenceNorm - b.ValenceNorm) * 1.20;
+                double acousticDist = Math.Abs(a.AcousticNorm - b.AcousticNorm) * 1.20;
+                return bpmDist + keyDist + energyDist + danceDist + valenceDist + acousticDist;
+            }
+            else
+            {
+                // Groove Lock:
+                // - Tight harmonic key matching (weight 0.40)
+                // - Strict energy consistency (weight 2.50)
+                // - Tight groove, valence, and acoustic matching (weight 2.00)
+                double keyDist = CamelotDistance(a.CamelotKey, b.CamelotKey) * 0.40;
+                double energyDist = Math.Abs(a.EnergyNorm - b.EnergyNorm) * 2.50;
+                double danceDist = Math.Abs(a.DanceNorm - b.DanceNorm) * 2.00;
+                double valenceDist = Math.Abs(a.ValenceNorm - b.ValenceNorm) * 2.00;
+                double acousticDist = Math.Abs(a.AcousticNorm - b.AcousticNorm) * 2.00;
+                return bpmDist + keyDist + energyDist + danceDist + valenceDist + acousticDist;
+            }
         }
 
         private static double CamelotDistance(string a, string b)
@@ -1538,15 +1767,23 @@ namespace MusicBeePlugin
             return 2 + diff;
         }
 
-        // ---- Debug Logging ----
+        // ---- Debug Logging with 2MB Self-Capping ----
 
         private void WriteLog(string message)
         {
             try
             {
                 Directory.CreateDirectory(MixerFolder);
+                string logPath = Path.Combine(MixerFolder, "mixer_debug.log");
+                FileInfo fi = new FileInfo(logPath);
+                if (fi.Exists && fi.Length > 2 * 1024 * 1024)
+                {
+                    string oldLog = Path.Combine(MixerFolder, "mixer_debug.old.log");
+                    try { File.Delete(oldLog); } catch {}
+                    try { File.Move(logPath, oldLog); } catch {}
+                }
                 File.AppendAllText(
-                    Path.Combine(MixerFolder, "mixer_debug.log"),
+                    logPath,
                     DateTime.Now.ToString("s", CultureInfo.InvariantCulture) + "  " + message + Environment.NewLine
                 );
             }

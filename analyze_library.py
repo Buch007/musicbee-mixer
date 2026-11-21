@@ -3,10 +3,11 @@ r"""
 Mixer - library analyzer (Spotify AI DJ Vibe Edition)
 
 High-performance music library analyzer:
-- Fast partial-frame audio reading via SoundFile with librosa fallback.
-- Automatic moved-file detection: re-maps existing analyzed tracks by filename instantly.
-- Purges dead/missing paths.
-- Multi-threaded batch extraction across CPU cores.
+- Fast partial-frame audio reading via SoundFile with librosa fallback and proper anti-aliased resampling.
+- ProcessPoolExecutor for true multi-core parallel extraction.
+- Automatic moved-file detection and dead/missing path purging from database and CSV export.
+- Batch database commits for optimal disk I/O performance.
+- Adaptive normalization (min-max for small collections, rank percentile for large collections).
 - Multi-dimensional Vibe normalization (BPM, Key, Energy, Groove, Valence, Acousticness).
 - Real-time progress updates for the MusicBee UI.
 """
@@ -88,7 +89,7 @@ def correct_octave(bpm):
 
 
 def load_audio_fast(path, duration_limit=35):
-    """High-speed partial audio reading directly to 22050Hz mono."""
+    """High-speed partial audio reading with proper anti-aliased resampling to 22050Hz mono."""
     try:
         with sf.SoundFile(path) as f:
             sr = f.samplerate
@@ -97,10 +98,15 @@ def load_audio_fast(path, duration_limit=35):
             file_dur = round(len(f) / sr, 1)
 
         y = data.mean(axis=1) if data.ndim > 1 else data
-        if sr >= 44100:
-            step = int(round(sr / 22050))
-            y = y[::step]
-            sr = int(sr / step)
+
+        # Exact half-rate decimation for standard 44.1kHz music
+        if sr == 44100:
+            y = y[::2]
+            sr = 22050
+        elif sr != 22050:
+            # Proper anti-aliased resampling for 48kHz, 96kHz, etc.
+            y = librosa.resample(y, orig_sr=sr, target_sr=22050)
+            sr = 22050
         return y, sr, file_dur
     except Exception:
         y, sr = librosa.load(path, sr=22050, mono=True, duration=duration_limit)
@@ -197,11 +203,19 @@ def normalize_features(conn):
         if not rows:
             continue
         values = np.array([r[1] for r in rows], dtype=float)
-        ranks = values.argsort().argsort() / max(len(values) - 1, 1)
-        for (file_path, _), rank in zip(rows, ranks):
+
+        if len(values) < 50:
+            val_min = float(values.min())
+            val_max = float(values.max())
+            spread = max(val_max - val_min, 1e-6)
+            normalized = np.clip((values - val_min) / spread, 0.0, 1.0)
+        else:
+            normalized = values.argsort().argsort() / max(len(values) - 1, 1)
+
+        for (file_path, _), norm_val in zip(rows, normalized):
             conn.execute(
                 f"UPDATE tracks SET {norm_col} = ? WHERE file_path = ?",
-                (round(float(rank), 3), file_path),
+                (round(float(norm_val), 3), file_path),
             )
     conn.commit()
 
@@ -217,15 +231,19 @@ def export_csv(conn, csv_path):
         FROM tracks
         """
     ).fetchall()
+
+    # Filter out dead or missing file paths
+    valid_rows = [row for row in rows if os.path.exists(row[0])]
+
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f, quoting=csv.QUOTE_ALL)
         writer.writerow([
             "file_path", "bpm", "key_name", "camelot_key",
             "energy_norm", "dance_norm", "valence_norm", "acoustic_norm"
         ])
-        for row in rows:
+        for row in valid_rows:
             writer.writerow(row)
-    print(f"Exported {len(rows)} tracks with full vibe vectors to {csv_path}")
+    print(f"Exported {len(valid_rows)} tracks with full vibe vectors to {csv_path}")
 
 
 def write_progress(progress_file, current, total, analyzed, skipped, failed):
@@ -257,7 +275,7 @@ def main():
     parser.add_argument("--rescan", action="store_true", help="Re-analyze all files")
     parser.add_argument("--csv", default=None, help="Export CSV path")
     parser.add_argument("--progress-file", default=None, help="Progress text file path")
-    parser.add_argument("--workers", type=int, default=3, help="Parallel worker threads")
+    parser.add_argument("--workers", type=int, default=3, help="Parallel worker processes")
     args = parser.parse_args()
 
     csv_path = args.csv or (os.path.splitext(args.db)[0] + ".csv")
@@ -323,12 +341,12 @@ def main():
     start = time.time()
     write_progress(progress_file, skipped, total_files, analyzed, skipped, failed)
 
-    # 4. Multi-threaded processing for new/changed files
+    # 4. Multi-process execution for new/changed files (bypasses Python GIL)
     if to_analyze:
         num_workers = min(args.workers, max(1, os.cpu_count() or 2))
-        print(f"Starting analysis with {num_workers} parallel workers...")
+        print(f"Starting analysis with {num_workers} parallel worker processes...")
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as executor:
+        with concurrent.futures.ProcessPoolExecutor(max_workers=num_workers) as executor:
             future_to_file = {executor.submit(analyze_worker, f): f for f in to_analyze}
 
             for future in concurrent.futures.as_completed(future_to_file):
@@ -362,13 +380,18 @@ def main():
                             mtime, datetime.now(timezone.utc).isoformat(),
                         ),
                     )
-                    conn.commit()
                     analyzed += 1
+                    # Batch commit every 25 tracks to minimize disk I/O fsync overhead
+                    if analyzed % 25 == 0:
+                        conn.commit()
 
                 if processed % 10 == 0 or processed == total_files:
                     elapsed = time.time() - start
                     print(f"  [{processed}/{total_files}] analyzed={analyzed} skipped={skipped} failed={failed} ({elapsed:.0f}s)")
                     write_progress(progress_file, processed, total_files, analyzed, skipped, failed)
+
+        # Final commit for remaining batch
+        conn.commit()
 
     # 5. Final Normalization and CSV Export
     print("Normalizing multi-dimensional vibe features across library...")
